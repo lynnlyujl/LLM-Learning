@@ -1,0 +1,319 @@
+# InsightAgent 指标口径知识库
+#
+# 使用方式：
+#   1. 复制到项目根目录，替换原来的 3 条版本
+#   2. python main.py all metrics25
+#   3. 对比 5/6 有没有变化
+#
+# 编写原则（基于消融实验结论）：
+#   - definition 是必须的：去掉 hint 仍能保持 5/6，说明规则本身有效
+#   - hint 只给"多步 CTE / 多表 join / 容易算错层级"的指标，简单的写了是浪费
+#   - aliases 要具体：避免"订单量"这种会被"订单量最多的州"误命中的泛词
+#
+# 口径统一约定：
+#   - 金额单位 BRL，GMV 一律不含运费
+#   - "有效订单" = order_status NOT IN ('canceled', 'unavailable')
+#   - 用户级指标一律用 customer_unique_id（人级），不用 customer_id（订单级）
+
+metrics:
+  # ============================================================
+  # 一、规模类（定义简单，无需 hint）
+  # ============================================================
+  - name: orders_count
+    aliases: ["订单数", "订单总数", "多少订单", "总订单数"]
+    definition: |
+      订单总数 = orders 表的行数，即 count(*) FROM orders。
+      不要用 order_items 计数 —— 那是商品项数（112,650），不是订单数（99,441）。
+
+  - name: gmv
+    aliases: ["GMV", "gmv", "商品交易总额", "成交额", "销售额", "营收"]
+    definition: |
+      商品交易总额。只统计有效订单：必须排除 order_status 为
+      'canceled' 和 'unavailable' 的订单。
+      金额取 v_order_fact.gmv（= order_items.price 之和），不含运费。
+    hint: |
+      SELECT sum(gmv) FROM v_order_fact
+      WHERE order_status NOT IN ('canceled', 'unavailable')
+        AND <时间条件>
+
+  - name: aov
+    aliases: ["客单价", "平均订单金额", "AOV"]
+    definition: |
+      客单价 = 有效订单的 GMV 总额 / 有效订单数。
+      分子和分母都排除 'canceled' 和 'unavailable'。
+    hint: |
+      SELECT sum(gmv) / count(*) FROM v_order_fact
+      WHERE order_status NOT IN ('canceled', 'unavailable')
+        AND <时间条件>
+
+  - name: aov_median
+    aliases: ["客单价中位数", "订单金额中位数"]
+    definition: |
+      订单金额的中位数（不是均值）。用 median 而不是 avg，避免少数大额订单拉偏。
+      排除 'canceled' 和 'unavailable'。
+    hint: |
+      SELECT median(gmv) FROM v_order_fact
+      WHERE order_status NOT IN ('canceled', 'unavailable')
+        AND <时间条件>
+
+  - name: items_per_order
+    aliases: ["平均商品数", "每单商品数", "件单比"]
+    definition: |
+      平均每单商品数 = avg(n_items)，排除 'canceled' 和 'unavailable'，
+      且只算 n_items > 0 的订单（有 775 个订单没有任何商品记录）。
+
+  - name: cancel_rate
+    aliases: ["取消率", "订单取消率"]
+    definition: |
+      取消率 = order_status = 'canceled' 的订单数 / 全部订单数。
+      注意 unlike GMV，这里分母是全部订单，不过滤状态。
+
+  # ============================================================
+  # 二、用户类（口径最敏感，全部给 hint）
+  # ============================================================
+  - name: repurchase_rate
+    aliases: ["复购率", "复购", "回头客"]
+    definition: |
+      复购率 = 下单次数 >= 2 的用户数 / 总用户数。
+      必须用 customer_unique_id（人级 ID），不能用 customer_id
+      （订单级 ID，每单一个新号，用错会让复购率恒为 0）。
+      统计时排除 'canceled' 和 'unavailable' 的订单。
+    hint: |
+      WITH u AS (
+        SELECT customer_unique_id, count(*) AS n
+        FROM v_order_fact
+        WHERE order_status NOT IN ('canceled', 'unavailable')
+        GROUP BY 1
+      )
+      SELECT sum(CASE WHEN n >= 2 THEN 1 ELSE 0 END)::DOUBLE / count(*)
+      FROM u
+
+  - name: new_customer_share
+    aliases: ["新客占比", "新用户占比", "新客比例"]
+    definition: |
+      新客占比 = 本期首次下单的用户数 / 本期下单用户数。
+      "首次"指该 customer_unique_id 在全历史中最早一次下单落在本期。
+      必须用 customer_unique_id，排除 'canceled' 和 'unavailable'。
+    hint: |
+      WITH f AS (
+        SELECT customer_unique_id, min(order_date) AS first_date
+        FROM v_order_fact
+        WHERE order_status NOT IN ('canceled', 'unavailable')
+        GROUP BY 1
+      )
+      SELECT sum(CASE WHEN first_date BETWEEN <起> AND <止> THEN 1 ELSE 0 END)::DOUBLE
+             / count(*)
+      FROM f
+
+  - name: mau
+    aliases: ["月活", "MAU", "活跃用户数", "月度活跃"]
+    definition: |
+      月活 = 当月有有效订单的去重用户数。
+      必须用 customer_unique_id（人级），排除 'canceled' 和 'unavailable'。
+    hint: |
+      SELECT strftime(order_date, '%Y-%m') AS ym,
+             count(DISTINCT customer_unique_id) AS mau
+      FROM v_order_fact
+      WHERE order_status NOT IN ('canceled', 'unavailable')
+      GROUP BY 1 ORDER BY 1
+
+  - name: high_value_users
+    aliases: ["高价值用户", "高价值用户数", "大客户数"]
+    definition: |
+      高价值用户 = 累计 GMV 超过 P90 分位的用户数。
+      按 customer_unique_id 聚合，排除 'canceled' 和 'unavailable'。
+    hint: |
+      WITH u AS (
+        SELECT customer_unique_id, sum(gmv) AS total
+        FROM v_order_fact
+        WHERE order_status NOT IN ('canceled', 'unavailable')
+        GROUP BY 1
+      )
+      SELECT count(*) FROM u
+      WHERE total >= (SELECT quantile_cont(total, 0.9) FROM u)
+
+  - name: repurchase_interval
+    aliases: ["复购间隔", "复购周期", "再次购买间隔"]
+    definition: |
+      复购间隔 = 同一 customer_unique_id 相邻两单的天数差，取中位数。
+      只算下单次数 >= 2 的用户，排除 'canceled' 和 'unavailable'。
+    hint: |
+      WITH o AS (
+        SELECT customer_unique_id, order_date,
+               lag(order_date) OVER (PARTITION BY customer_unique_id ORDER BY order_date) AS prev
+        FROM v_order_fact
+        WHERE order_status NOT IN ('canceled', 'unavailable')
+      )
+      SELECT median(date_diff('day', prev, order_date)) FROM o WHERE prev IS NOT NULL
+
+  # ============================================================
+  # 三、履约类
+  # ============================================================
+  - name: avg_delivery_days
+    aliases: ["平均配送时长", "配送时长", "配送天数", "送达时长", "物流时长"]
+    definition: |
+      平均配送时长 = avg(date_diff('day', 下单时间, 签收时间))。
+      只算 order_status = 'delivered' 且签收时间非空的订单。
+      用"下单 → 签收"，不是"发货 → 签收" —— 后者少算了卖家处理时间。
+    hint: |
+      SELECT avg(date_diff('day', order_purchase_timestamp,
+                           order_delivered_customer_date))
+      FROM orders
+      WHERE order_status = 'delivered'
+        AND order_delivered_customer_date IS NOT NULL
+
+  - name: late_delivery_rate
+    aliases: ["延迟交付率", "延迟率", "超时率", "延迟送达"]
+    definition: |
+      延迟交付率 = 签收晚于承诺送达时间的订单 / 已签收订单。
+      只算 order_status = 'delivered' 且签收时间非空的订单。
+      未签收的订单不能算成"不延迟"，必须排除。
+    hint: |
+      SELECT avg(CASE WHEN order_delivered_customer_date > order_estimated_delivery_date
+                      THEN 1 ELSE 0 END)
+      FROM orders
+      WHERE order_status = 'delivered'
+        AND order_delivered_customer_date IS NOT NULL
+
+  - name: freight_ratio
+    aliases: ["运费占比", "运费比例", "运费率"]
+    definition: |
+      运费占比 = sum(freight) / sum(gmv)，两者都来自 v_order_fact。
+      排除 'canceled' 和 'unavailable'。
+
+  # ============================================================
+  # 四、评价类（订单级 vs 商品级是最容易错的）
+  # ============================================================
+  - name: avg_review_score
+    aliases: ["平均评分", "平均分", "评分均值", "平均得分"]
+    definition: |
+      平均评分 = avg(review_score)，评价是【订单级】的。
+      一条评价对应一个订单，一个订单可能有多个商品 / 多个品类。
+      绝对不能先 join order_items 再 avg —— 同一条评价会被该订单的
+      每个商品行重复计算，导致样本量虚高、均值偏移。
+      需要按品类统计时必须先 DISTINCT (review_id, 品类)。
+    hint: |
+      SELECT avg(review_score) FROM order_reviews
+
+  - name: good_review_rate
+    aliases: ["好评率"]
+    definition: |
+      好评率 = 评分 >= 4 的评价数 / 总评价数。评价为订单级，不 join order_items。
+
+  - name: bad_review_rate
+    aliases: ["差评率"]
+    definition: |
+      差评率 = 评分 <= 2 的评价数 / 总评价数。评价为订单级，不 join order_items。
+
+  - name: category_rating
+    aliases: ["品类评分", "各品类平均评分", "品类好评"]
+    definition: |
+      各品类的平均评分。品类名统一用英文（category_translation 的
+      product_category_name_english）。
+      必须先去重到 (review_id, 品类) 再算平均，否则一条评价会在该订单的
+      每个商品行上被重复计数。
+    hint: |
+      WITH rev_cat AS (
+        SELECT DISTINCT rv.review_id,
+               ct.product_category_name_english AS category,
+               rv.review_score
+        FROM order_reviews rv
+        JOIN order_items oi ON oi.order_id = rv.order_id
+        JOIN products p ON p.product_id = oi.product_id
+        JOIN category_translation ct ON p.product_category_name = ct.product_category_name
+        WHERE ct.product_category_name_english IS NOT NULL
+      )
+      SELECT category, avg(review_score), count(*)
+      FROM rev_cat GROUP BY 1 HAVING count(*) >= 50
+      ORDER BY 2 DESC, 1 ASC
+
+  - name: review_coverage
+    aliases: ["评论覆盖率", "评价覆盖率", "评论率"]
+    definition: |
+      评论覆盖率 = 有评价的已签收订单数 / 已签收订单数。
+      分母只算 order_status = 'delivered' 的订单。
+    hint: |
+      SELECT count(DISTINCT rv.order_id)::DOUBLE / count(DISTINCT o.order_id)
+      FROM orders o
+      LEFT JOIN order_reviews rv ON rv.order_id = o.order_id
+      WHERE o.order_status = 'delivered'
+
+  - name: review_response_hours
+    aliases: ["评价响应时长", "评论响应时间", "评价回复时长"]
+    definition: |
+      评价响应时长 = avg(review_answer_timestamp - review_creation_date)，
+      单位小时。用 date_diff('hour', ...)。
+
+  # ============================================================
+  # 五、结构类（占比 / 集中度 / 增长）
+  # ============================================================
+  - name: category_gmv_share
+    aliases: ["品类GMV占比", "类目占比", "品类占比", "各品类GMV"]
+    definition: |
+      各品类的 GMV 占比。品类名统一用英文 product_category_name_english。
+      需要 join order_items → products → category_translation。
+      排除 'canceled' 和 'unavailable'。
+    hint: |
+      SELECT ct.product_category_name_english AS category,
+             sum(oi.price) AS gmv,
+             sum(oi.price) / sum(sum(oi.price)) OVER () AS share
+      FROM orders o
+      JOIN order_items oi ON oi.order_id = o.order_id
+      JOIN products p ON p.product_id = oi.product_id
+      JOIN category_translation ct ON p.product_category_name = ct.product_category_name
+      WHERE o.order_status NOT IN ('canceled', 'unavailable')
+      GROUP BY 1 ORDER BY 2 DESC
+
+  - name: state_gmv_share
+    aliases: ["州GMV占比", "地区GMV占比", "各州GMV", "地区分布"]
+    definition: |
+      各州（customer_state）的 GMV 占比，排除 'canceled' 和 'unavailable'。
+      直接用 v_order_fact 的 state 列。
+
+  - name: seller_concentration
+    aliases: ["卖家集中度", "头部卖家占比", "卖家垄断度"]
+    definition: |
+      卖家集中度 = Top10 卖家 GMV / 总 GMV。
+      需要 join order_items 拿 seller_id，排除 'canceled' 和 'unavailable'。
+    hint: |
+      WITH s AS (
+        SELECT oi.seller_id, sum(oi.price) AS gmv
+        FROM orders o JOIN order_items oi USING (order_id)
+        WHERE o.order_status NOT IN ('canceled', 'unavailable')
+        GROUP BY 1
+      )
+      SELECT sum(gmv) FILTER (WHERE rn <= 10) / sum(gmv)
+      FROM (SELECT *, row_number() OVER (ORDER BY gmv DESC) AS rn FROM s)
+
+  - name: payment_type_share
+    aliases: ["支付方式分布", "支付方式占比", "支付方式"]
+    definition: |
+      各支付方式的订单占比。order_payments 是一对多（一单可拆多笔），
+      统计订单数时必须 count(DISTINCT order_id)，否则一单会被算多次。
+    hint: |
+      SELECT payment_type,
+             count(DISTINCT order_id) AS orders
+      FROM order_payments GROUP BY 1 ORDER BY 2 DESC
+
+  - name: installment_share
+    aliases: ["分期占比", "分期订单占比"]
+    definition: |
+      分期订单占比 = 存在 payment_installments > 1 的订单数 / 有支付记录的订单数。
+      按 order_id 去重后再统计。
+
+  - name: mom_growth
+    aliases: ["环比增长", "环比", "月环比", "环比变化"]
+    definition: |
+      环比增长率 = (本期 GMV - 上期 GMV) / 上期 GMV。
+      先按月聚合 GMV（排除 'canceled' 和 'unavailable'），再用 lag() 取上期。
+      注意数据在 2018-09 之后几乎断档，末期环比会失真。
+    hint: |
+      WITH m AS (
+        SELECT strftime(order_date, '%Y-%m') AS ym, sum(gmv) AS gmv
+        FROM v_order_fact
+        WHERE order_status NOT IN ('canceled', 'unavailable')
+        GROUP BY 1
+      )
+      SELECT ym, gmv,
+             (gmv - lag(gmv) OVER (ORDER BY ym)) / lag(gmv) OVER (ORDER BY ym) AS mom
+      FROM m ORDER BY ym

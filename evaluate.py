@@ -6,7 +6,7 @@ import numbers
 import datetime
 from pathlib import Path
 
-from read_cases import cases_by_id
+from read_cases import cases_by_id, DEFAULT_CASES
 from connect_db import connect, run_query
 
 ##格式化单元格
@@ -68,14 +68,24 @@ def compare(pred_rows, gold_rows):
             return False, "值不同（超出容差）"
     return (True, "") if not remaining else (False, "值不同（超出容差）")
 
-def evaluate_result(pred_path):
+def evaluate_result(pred_path, cases_path = None):
     pred_path = Path(pred_path)
     if not pred_path.exists():
         print(f"找不到路径文件 {pred_path}")
         return None
 
+    with open(pred_path, encoding = "utf-8") as f:
+        preds = [json.loads(line) for line in f if line.strip()]
+
+    # 优先级：命令行参数 > 预测文件里记录的 > 默认
+    if cases_path is None:
+        cases_path = preds[0].get("cases_file", DEFAULT_CASES) if preds else DEFAULT_CASES
+
     con = connect()
-    gold_map = cases_by_id()
+    gold_map = cases_by_id(cases_path)
+
+    print(f"预测文件: {pred_path.name}")
+    print(f"用例文件: {cases_path}")
 
     with open(pred_path, encoding="utf-8") as f:
         preds = [json.loads(line) for line in f if line.strip()]

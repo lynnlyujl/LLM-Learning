@@ -6,12 +6,6 @@ import duckdb
 
 DB_PATH = "data/olist.duckdb"
 
-con = duckdb.connect("data/olist.duckdb", read_only=True)
-con.execute("SET MEMORY_LIMIT = '1GB'")
-con.execute("SET threads = 2")
-print("----数据库连接成功----")
-print("    orders 行数:", con.execute("SELECT count(*) FROM orders").fetchone()[0])
-
 ##链接数据库
 def connect(path = DB_PATH):
     con = duckdb.connect("data/olist.duckdb", read_only=True)
@@ -42,3 +36,9 @@ def get_schema(con):
         parts.append(f"{type} {name} ({coldef})")
 
     return "\n".join(parts)
+
+
+if __name__ == "__main__":
+    con = connect()
+    print("----数据库连接成功----")
+    print("    orders 行数:", run_query(con, "SELECT count(*) FROM orders"))

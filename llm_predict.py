@@ -6,18 +6,24 @@ import json
 import datetime
 from pathlib import Path
 
-from read_cases import load_cases
+from read_cases import load_cases, DEFAULT_CASES
 from llm_running import ask, clean_sql, model
 
+from metrics import match_metrics, render_block
+from examples import retrieve, render_examples
+
 ##预测函数
-def predict(schema, tag = "baseline"):
-    cases = load_cases()
+def predict(schema, tag = "baseline", cases_path = DEFAULT_CASES):
+    cases = load_cases(cases_path)
     rows = []
+    print(f"用例文件: {cases_path}")
     print(f"用例数: {len(cases)}  模型: {model}")
     print("=" * 30)
 
     for i in cases:
-        raw, usage = ask(schema, i["q"])
+        block = render_block(match_metrics(i["q"]))
+        mblock = render_block(match_metrics(i["q"]))
+        raw, usage = ask(schema, i["q"], block, mblock)
 
         sql = clean_sql(raw)
 
@@ -28,7 +34,8 @@ def predict(schema, tag = "baseline"):
             "q": i["q"],
             "pred_sql":sql,
             "prompt_tokens":usage.prompt_tokens,
-            "completion_tokens":usage.completion_tokens
+            "completion_tokens":usage.completion_tokens,
+            "cases_file": cases_path
         })
         print(f"[{i['id']}] {i['q']}")
         print(f"     {sql[:150]}")

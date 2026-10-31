@@ -4,11 +4,11 @@
 import json
 from pathlib import Path
 
-case_path = Path("cases.jsonl")
+DEFAULT_CASES = "cases.jsonl"
 
 ##读取case json中的case
 def load_cases(path = None):
-    p = Path(path) if path else case_path
+    p = Path(path) if path else Path(DEFAULT_CASES)
     with open(p, encoding="utf-8") as f:
         # 逐行解析：每行是一个独立 JSON
         # if line.strip() 跳过空行，防止文件末尾多一个换行导致崩溃

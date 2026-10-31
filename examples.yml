@@ -1,0 +1,180 @@
+# InsightAgent · Few-shot SQL 样例库
+#
+# 字段说明：
+#   q        示例问题（会进索引）
+#   keywords 领域关键词（会进索引）—— 这是提高检索区分度的关键
+#   cat      模式分类（只用于展示）
+#   sql      示例 SQL（只用于展示，不进索引）
+#   note     写法说明（只用于展示，不进索引）
+#
+# 为什么 note 和 sql 不进索引：
+#   note 里会出现"评价""订单""评分"等通用词，会把不相关的问题也拉过来。
+#   例如"平均配送时长"曾因 note 里有"订单"而命中"各卖家平均评分"。
+#   索引只用「问题 + 关键词」，信号更干净。
+#
+# 关键词的写法原则：
+#   写用户真实会说的词，不写数据库字段名。
+#   例如用户说"多少订单""订单量"，不会说"orders_count"。
+
+examples:
+  # ------------------------------------------------------------
+  # 模式 1：时间区间聚合
+  # ------------------------------------------------------------
+  - q: "2017 年 3 月一共有多少订单"
+    cat: 时间聚合
+    keywords: ['某月', '几月', '订单量', '多少订单', 'GMV']
+    sql: |
+      SELECT count(*) AS orders
+      FROM orders
+      WHERE order_purchase_timestamp >= '2017-03-01'
+        AND order_purchase_timestamp <  '2017-04-01'
+    note: |
+      时间区间用半开区间 >= 起 AND < 止，不要用 BETWEEN，
+      否则边界那天的记录会被漏掉或重复计入下月。
+
+  # ------------------------------------------------------------
+  # 模式 2：Top-N 排序
+  # ------------------------------------------------------------
+  - q: "评分最低的 5 个卖家是哪些"
+    cat: Top-N
+    keywords: ["最多", "最少", "最高", "最低", "前5", "前 5", "排名", "排行", "top", "TOP", "排序"]
+    sql: |
+      WITH s AS (
+        SELECT oi.seller_id,
+               avg(rv.review_score) AS avg_score,
+               count(*) AS n
+        FROM order_items oi
+        JOIN order_reviews rv ON rv.order_id = oi.order_id
+        GROUP BY 1
+        HAVING count(*) >= 30
+      )
+      SELECT seller_id, avg_score, n
+      FROM s
+      ORDER BY avg_score ASC, seller_id ASC
+      LIMIT 5
+    note: |
+      Top-N 必须加 HAVING 过滤样本太少的组，否则只有 1 条评价的卖家会霸榜。
+      排序要加第二排序键，否则并列时结果不稳定。
+
+  # ------------------------------------------------------------
+  # 模式 3：去重后聚合（最容易被算错的模式）
+  # ------------------------------------------------------------
+  - q: "各州的平均评分是多少"
+    cat: 去重聚合
+    keywords: ["各州", "各品类", "各类目", "各商品类别", "各城市", "各卖家", "平均评分", "平均分", "评分", "评价", "好评", "差评", "分组", "按维度"]
+    sql: |
+      WITH rev_state AS (
+        SELECT DISTINCT rv.review_id,
+               c.customer_state AS state,
+               rv.review_score
+        FROM order_reviews rv
+        JOIN orders o ON o.order_id = rv.order_id
+        JOIN customers c ON c.customer_id = o.customer_id
+      )
+      SELECT state,
+             avg(review_score) AS avg_score,
+             count(*) AS n_reviews
+      FROM rev_state
+      GROUP BY 1
+      ORDER BY avg_score DESC, state ASC
+    note: |
+      关键两步，顺序不能反：
+      1. 先把目标维度 join 进来（这里从 customers 取 state）
+      2. 再 DISTINCT 到 (review_id, 目标维度)
+
+      注意：不要对 order_items 去重 —— 那条路只去掉了重复商品行，
+      同一订单里同品类的多个商品仍会让一条评价被重复计数。
+      去重的对象永远是【维度】，不是中间表。
+
+  # ------------------------------------------------------------
+  # 模式 4：比率
+  # ------------------------------------------------------------
+  - q: "取消订单的占比是多少"
+    cat: 比率
+    keywords: ["占比", "比例", "比率", "率是多少", "取消", "取消率", "百分比"]
+    sql: |
+      SELECT avg(CASE WHEN order_status = 'canceled' THEN 1 ELSE 0 END) AS cancel_rate
+      FROM orders
+    note: |
+      比率用 avg(CASE WHEN 条件 THEN 1 ELSE 0 END)，比 sum/count 更简洁。
+
+  # ------------------------------------------------------------
+  # 模式 5：环比（窗口函数）
+  # ------------------------------------------------------------
+  - q: "逐月的销售额环比变化"
+    cat: 环比
+    keywords: ['环比', '同比', '增长', '变化趋势', '逐月', '月度趋势', '走势']
+    sql: |
+      WITH m AS (
+        SELECT strftime(order_date, '%Y-%m') AS ym,
+               sum(gmv) AS gmv
+        FROM v_order_fact
+        WHERE order_status NOT IN ('canceled', 'unavailable')
+        GROUP BY 1
+      )
+      SELECT ym, gmv,
+             (gmv - lag(gmv) OVER (ORDER BY ym)) / lag(gmv) OVER (ORDER BY ym) AS mom
+      FROM m
+      ORDER BY ym
+    note: |
+      环比用 lag() 窗口函数取上期值。注意数据在 2018-09 之后几乎断档，
+      末期环比会失真，解读时要提示。
+
+  # ------------------------------------------------------------
+  # 模式 6：一对多表计数（必须去重）
+  # ------------------------------------------------------------
+  - q: "各支付方式的订单数是多少"
+    cat: 一对多计数
+    keywords: ["支付方式", "支付", "分期", "信用卡", "订单数", "多少笔"]
+    sql: |
+      SELECT payment_type,
+             count(DISTINCT order_id) AS orders
+      FROM order_payments
+      GROUP BY 1
+      ORDER BY 2 DESC
+    note: |
+      order_payments 是一对多（一单可以拆成信用卡 + 代金券多笔）。
+      统计"订单数"必须 count(DISTINCT order_id)，否则一单会被算多次。
+
+  # ------------------------------------------------------------
+  # 模式 7：用户级去重
+  # ------------------------------------------------------------
+  - q: "一共有多少个不同的客户下过单"
+    cat: 用户去重
+    keywords: ["多少个客户", "多少用户", "多少客户", "复购", "复购率", "用户数", "客户数", "活跃用户", "新客", "新用户"]
+    sql: |
+      SELECT count(DISTINCT c.customer_unique_id) AS users
+      FROM orders o
+      JOIN customers c USING (customer_id)
+    note: |
+      customer_id 是订单级的（每单一个新号），customer_unique_id 才是人级。
+      所有"多少个客户/用户"的问题都必须用 customer_unique_id。
+
+  # ------------------------------------------------------------
+  # 模式 8：条件占比
+  # ------------------------------------------------------------
+  - q: "评分大于等于 4 的订单占比是多少"
+    cat: 条件占比
+    keywords: ["好评率", "差评率", "占比", "比例", "评分分布", "多少分"]
+    sql: |
+      SELECT avg(CASE WHEN review_score >= 4 THEN 1 ELSE 0 END) AS good_rate
+      FROM order_reviews
+    note: |
+      评价是订单级的，直接对 order_reviews 聚合即可，不要 JOIN order_items。
+
+  # ------------------------------------------------------------
+  # 模式 9：时间差计算（配送 / 履约）
+  # ------------------------------------------------------------
+  - q: "平均发货到签收要几天"
+    cat: 时间差
+    keywords: ["配送", "配送时长", "送达", "签收", "发货", "物流", "多少天", "几天", "时长", "延迟", "超时"]
+    sql: |
+      SELECT avg(date_diff('day', order_purchase_timestamp,
+                           order_delivered_customer_date)) AS avg_days
+      FROM orders
+      WHERE order_status = 'delivered'
+        AND order_delivered_customer_date IS NOT NULL
+    note: |
+      两个时间戳相减用 date_diff('day', 起, 止)。
+      必须排除未签收的订单（签收时间为 NULL），否则平均值会被拉偏。
+      并限定 order_status = 'delivered'。
